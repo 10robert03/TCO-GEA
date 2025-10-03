@@ -1,0 +1,21 @@
+{
+
+  "SEP_SQLFeedSolidsMin_VolPerc": { "type": "meta" },
+  "SEP_SQLFeedSolidsMax_VolPerc": { "type": "meta" },
+  "SEP_SQLDiameterMM": { "type": "meta" },
+  "SEP_SQLTotalWeightKg": { "type": "meta" },
+  "SEP_SQLBowlVolumeLit": { "type": "meta" },
+
+
+  "CoolingWater": {
+    "formula": "forecast_cost(wasserpreis, infl_wasser, jahre, value * betriebsstunden)"
+  },
+
+
+  "CustomEnergy": "forecast_cost(strompreis, infl_strom, jahre, value * betriebsstunden)",
+
+
+  "ExtraTransport": {
+    "formula": "value * distanz * transportpreis"
+  }
+}
