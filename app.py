@@ -1,6 +1,8 @@
 import os
 import streamlit as st
 import pandas as pd
+import json
+import os
 import matplotlib.pyplot as plt
 from fpdf import FPDF
 
@@ -59,11 +61,96 @@ def to_float(x, default=0.0):
     try:
         if pd.isna(x):
             return default
-        if isinstance(x, str) and x.strip().lower() in ["", "-", "n/a", "na", "none"]:
-            return default
+        if isinstance(x, str):
+            s = x.strip().lower()
+            if s in ["", "-", "n/a", "na", "none"]:
+                return default
+            # Komma-Decimal nach Punkt wandeln (de-DE CSV/Excel)
+            s = s.replace(",", ".")
+            return float(s)
         return float(x)
     except:
         return default
+
+def parse_efficiency(x):
+    """
+    Normalisiert Effizienz:
+    - "0,92" -> 0.92
+    - 92     -> 0.92 (wenn 1 < e <= 100 → Prozentannahme)
+    - sichert gegen 0/negativ und >1 ab.
+    """
+    e = to_float(x, default=0.9)
+    if e > 1.0 and e <= 100.0:
+        e = e / 100.0
+    # clamp
+    if e <= 0:
+        e = 0.9
+    if e > 1.0:
+        e = 1.0
+    return max(e, 1e-3)  # nicht zu klein werden lassen
+
+
+def forecast_cost(base_price, inflation, jahre, annual_consumption):
+    """
+    Berechnet Gesamtkosten über mehrere Jahre mit Inflation (Zinseszinseffekt).
+    base_price: Startpreis (€/kWh oder €/m³)
+    inflation: jährliche Rate (0.03 = 3%)
+    jahre: Laufzeit in Jahren
+    annual_consumption: Verbrauch pro Jahr (z.B. kWh oder m³)
+    """
+    total = 0.0
+    for year in range(1, int(jahre) + 1):
+        price = base_price * ((1 + inflation) ** (year - 1))
+        total += annual_consumption * price
+    return total
+
+
+# ---------------------------
+# TCO Calculation
+# ---------------------------
+
+
+# ---------------------------
+# Regeln laden
+# ---------------------------
+
+
+# ---------------------------
+# Regeln laden
+# ---------------------------
+def load_rules(file="rules.json"):
+    if os.path.exists(file):
+        with open(file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+rules = load_rules()
+# ---------------------------
+# Heuristik: Ist eine Spalte wahrscheinlich eine Kosten-Spalte?
+# ---------------------------
+def is_probably_cost_column(col: str) -> bool:
+    col_lower = col.lower()
+
+    # Keywords, die klar für Kosten sprechen
+    cost_keywords = [
+        "cost", "preis", "price", "fee", "service",
+        "maintenance", "energy", "wasser", "transport"
+    ]
+
+    # Keywords, die eindeutig Meta/technisch sind
+    meta_keywords = [
+        "perc", "min", "max", "durchmesser", "diameter",
+        "gewicht", "weight", "volumen", "volume",
+        "rpm", "speed", "temp", "temperature",
+        "druck", "pressure", "feststoff", "solids"
+    ]
+
+    # Technische Spalten sofort ausschließen
+    if any(mk in col_lower for mk in meta_keywords):
+        return False
+
+    # Nur Kosten-relevante Spalten durchlassen
+    return any(ck in col_lower for ck in cost_keywords)
 
 # ---------------------------
 # TCO Calculation
@@ -72,120 +159,44 @@ def to_float(x, default=0.0):
 def calculate_tco(row, betriebsstunden, jahre, standort, kundendaten=None):
     strompreis = get_energy_price(standort)
     wasserpreis = get_water_price(standort)
-    abwasserpreis = get_wastewater_price(standort)
     transportpreis = get_transport_price(standort)
 
-    # Forecast-Inflationsraten (Defaults: Strom ~3%, Wasser ~2% -> im UI auf %/100 setzen)
     infl_strom = (kundendaten or {}).get("Strom Inflation", 0.0)
     infl_wasser = (kundendaten or {}).get("Wasser Inflation", 0.0)
 
-    # Duty-Cycle für kontinuierlichen Wasserfluss (0..1). Falls Nutzer % eingibt, konvertieren.
-    duty = to_float((kundendaten or {}).get("Wasser Duty Cycle", 0.2), 0.2)
-    if duty > 1.0:
-        duty = duty / 100.0
-    duty = max(0.0, min(duty, 1.0))
-
-    # Optional: kontinuierlicher Wasserfluss ganz deaktivieren (nur Ejektionswasser)
-    cont_flow_enabled = bool((kundendaten or {}).get("Dauerfluss aktiv", True))
-
     costs = {}
 
-    # ---------------------------
-    # CAPEX
-    # ---------------------------
+    # --- CAPEX (Listenpreis) ---
     capex = to_float(row.get("Listprice", 0))
     costs["Capex"] = capex
 
-    # ---------------------------
-    # ENERGIE mit Forecast
-    # ---------------------------
-    motor_power = to_float(row.get("SEP_SQLMotorPowerKW", row.get("power consumption TOTAL [kW]", 0)))
-    energy_cost = 0.0
+    # --- Energie (Motorleistung) mit Forecast ---
+    motor_power = to_float(row.get("SEP_SQLMotorPowerKW", 0))
     if motor_power > 0:
-        eff = to_float(row.get("SEP_SQLMotorEfficiency", 1), 1)
-        if eff <= 0: eff = 1
-        power = motor_power * 0.8  # 80% Last
-        for year in range(jahre):
-            strompreis_jahr = strompreis * (1 + infl_strom) ** year
-            energy_cost += power * betriebsstunden * strompreis_jahr / eff
+        eff = parse_efficiency(row.get("SEP_SQLMotorEfficiency", 1))
+        power = motor_power * 0.8
+        annual_kwh = (power * betriebsstunden) / eff
+        energy_cost = forecast_cost(strompreis, infl_strom, jahre, annual_kwh)
         costs["Energie"] = energy_cost
 
-    # ---------------------------
-    # WASSER + ABWASSER + PUMPENERGIE (mit Forecast & Duty-Cycle)
-    # ---------------------------
-    water_total = 0.0
-    water_l = to_float(row.get("SEP_SQLOpWaterls", 0))  # l/s oder l/h
-    unit = (kundendaten or {}).get("Wasser Einheit", "l/s")
-    pump_eff = max(min(to_float((kundendaten or {}).get("Pumpenwirkungsgrad", 0.6), 0.6), 0.95), 0.05)
+    # --- Wasser (Dauerverbrauch) mit Forecast ---
+    water = to_float(row.get("SEP_SQLOpWaterls", 0))  # l/s
+    if water > 0:
+        m3_per_h = (water * 3600) / 1000
+        annual_m3 = m3_per_h * betriebsstunden
+        wasser_cost = forecast_cost(wasserpreis, infl_wasser, jahre, annual_m3)
+        costs["Wasser"] = wasser_cost
 
-    # Durchfluss-Basis in m³/h und m³/s
-    m3_per_h_base = 0.0
-    Q_m3_s_base = 0.0
-    if water_l > 0:
-        if unit == "l/s":
-            m3_per_h_base = (water_l * 3600.0) / 1000.0
-            Q_m3_s_base = water_l / 1000.0
-        else:  # l/h
-            m3_per_h_base = water_l / 1000.0
-            Q_m3_s_base = (water_l / 3600.0) / 1000.0
+    # --- Wasser pro Ejekt mit Forecast ---
+    water_eject = to_float(row.get("SEP_SQLOpWaterliteject", 0))  # l/Ejekt
+    ejects = to_float(row.get("number of ejection per hour", 0))
+    if water_eject > 0 and ejects > 0:
+        m3_per_eject = water_eject / 1000
+        annual_m3_eject = m3_per_eject * ejects * betriebsstunden
+        eject_cost = forecast_cost(wasserpreis, infl_wasser, jahre, annual_m3_eject)
+        costs["Eject-Wasser"] = eject_cost
 
-    # Duty-Cycle anwenden (falls Dauerfluss aktiv)
-    m3_per_h_cont = m3_per_h_base * duty if cont_flow_enabled else 0.0
-    Q_m3_s_cont = Q_m3_s_base * duty if cont_flow_enabled else 0.0
-
-    # Druckquelle (Excel oder manuell)
-    if (kundendaten or {}).get("Excel-Druck verwenden", True):
-        pressure_bar = to_float(row.get("SEP_SQLOpWaterSupplyBar", 0))
-        if pressure_bar == 0:
-            pressure_bar = to_float((kundendaten or {}).get("Manueller Druck (bar)", 2.5), 2.5)
-    else:
-        pressure_bar = to_float((kundendaten or {}).get("Manueller Druck (bar)", 2.5), 2.5)
-
-    # Pumpenleistung nur für den (ggf. gedrosselten) Dauerfluss
-    pump_power_kw_cont = 0.0
-    if Q_m3_s_cont > 0 and pressure_bar > 0:
-        delta_p_pa = pressure_bar * 1e5  # 1 bar = 1e5 Pa
-        pump_power_kw_cont = (Q_m3_s_cont * delta_p_pa) / (pump_eff * 1000.0)  # W→kW
-
-    # Jährliche Aufsummierung: Volumen + Pumpenergie (kont. Anteil)
-    for year in range(jahre):
-        wasserpreis_mix = (wasserpreis + abwasserpreis) * (1 + infl_wasser) ** year
-        # Volumengebühren (nur wenn Dauerfluss aktiv)
-        if m3_per_h_cont > 0:
-            water_total += m3_per_h_cont * betriebsstunden * wasserpreis_mix
-        # Pumpenergie für Dauerfluss
-        if pump_power_kw_cont > 0:
-            strompreis_jahr = strompreis * (1 + infl_strom) ** year
-            pump_energy_cost_year = pump_power_kw_cont * betriebsstunden * strompreis_jahr
-            # Hydrostop → 10% weniger Pumpenergie (nur auf Pumpenergie!)
-            eject_sys = str(row.get("ejection system", "")).lower()
-            if eject_sys == "hydrostop":
-                saving = 0.10 * pump_energy_cost_year
-                pump_energy_cost_year -= saving
-                costs["Hydrostop-Einsparung (Pumpenergie)"] = costs.get("Hydrostop-Einsparung (Pumpenergie)", 0) - saving
-            water_total += pump_energy_cost_year
-
-    # Ejektionswasser (unabhängig vom Duty-Cycle, da über Ejektionen definiert)
-    water_eject_l = to_float(row.get("SEP_SQLOpWaterliteject", 0))  # l/Ejekt
-    ejects_h = to_float(row.get("number of ejection per hour", 0))
-    if water_eject_l > 0 and ejects_h > 0:
-        m3_per_eject = water_eject_l / 1000.0
-        for year in range(jahre):
-            wasserpreis_mix = (wasserpreis + abwasserpreis) * (1 + infl_wasser) ** year
-            water_total += m3_per_eject * ejects_h * betriebsstunden * wasserpreis_mix
-
-    # Optional: Plausibilisierung vs. Energie (falls gewünscht)
-    if (kundendaten or {}).get("Wasser plausibilisieren", False) and energy_cost > 0:
-        lower_ratio = (kundendaten or {}).get("Wasser Min Ratio", 0.6)
-        upper_ratio = (kundendaten or {}).get("Wasser Max Ratio", 1.2)
-        water_total = max(min(water_total, energy_cost * upper_ratio), energy_cost * lower_ratio)
-
-    if water_total > 0:
-        costs["Wasser"] = water_total
-
-    # ---------------------------
-    # SERVICE (vereinfachte Logik)
-    # ---------------------------
+    # --- Servicekosten nach DMR ---
     dmr = to_float(row.get("SEP_SQLDMR", 0))
     if dmr > 0:
         total_hours = betriebsstunden * jahre
@@ -201,36 +212,34 @@ def calculate_tco(row, betriebsstunden, jahre, standort, kundendaten=None):
         if num_services > 0:
             costs["Service"] = num_services * service_price
 
-    # ---------------------------
-    # EFFIZIENZVERLUST RIEMEN
-    # ---------------------------
+    # --- Riemenantrieb (Effizienzverlust) ---
     drive_type = str(row.get("SEP_DriveType", "")).lower()
     if drive_type in ["belt", "riemen", "yes", "ja", "true", "1"]:
         ineffizienz = 0.01 * jahre
-        penalty = sum(v for k, v in costs.items() if isinstance(v, (int, float))) * ineffizienz
+        penalty = sum(costs.values()) * ineffizienz
         if penalty > 0:
             costs["Effizienzverlust (Belt)"] = penalty
 
-    # ---------------------------
-    # FESTSTOFFVERLUST
-    # ---------------------------
+    # --- Hydrostop Bonus (Pumpenergie-Anteil) ---
+    eject_sys = str(row.get("ejection system", "")).lower()
+    if eject_sys == "hydrostop" and "Wasser" in costs:
+        saving = 0.10 * costs["Wasser"]
+        costs["Hydrostop-Einsparung (Pumpenergie)"] = -saving
+
+    # --- Feststoffanteil (Proxy-Verluste) ---
     if kundendaten and "Feststoffanteil" in kundendaten:
         feststoff = to_float(kundendaten["Feststoffanteil"])
         extra_loss = feststoff * 0.001 * betriebsstunden * jahre
         if extra_loss > 0:
             costs["Produktverlust (Fluid)"] = extra_loss
 
-    # ---------------------------
-    # TRANSPORT
-    # ---------------------------
-    weight_tons = to_float(row.get("SEP_SQLTotalWeightKg", 0)) / 1000.0
-    distanz = to_float((kundendaten or {}).get("Distanz_km", 500))
+    # --- Transport ---
+    weight_tons = to_float(row.get("SEP_SQLTotalWeightKg", 0)) / 1000
+    distanz = to_float(kundendaten.get("Distanz_km", 500) if kundendaten else 500)
     if weight_tons > 0 and distanz > 0:
         costs["Transport"] = weight_tons * distanz * transportpreis
 
-    # ---------------------------
-    # PRODUKTWECHSEL
-    # ---------------------------
+    # --- Produktwechsel ---
     volume = to_float(row.get("SEP_SQLBowlVolumeLit", 0))
     if volume > 0 and kundendaten:
         switches = to_float(kundendaten.get("Produktwechsel pro Jahr", 0))
@@ -238,23 +247,91 @@ def calculate_tco(row, betriebsstunden, jahre, standort, kundendaten=None):
             costs["Produktwechsel"] = volume * switches * jahre
 
     # ---------------------------
-    # GESAMT
+    # Dynamische Regeln aus rules.json
     # ---------------------------
-    tco = sum(v for k, v in costs.items() if isinstance(v, (int, float)))
+    try:
+        with open("rules.json", "r", encoding="utf-8") as f:
+            rules = json.load(f)
+    except FileNotFoundError:
+        rules = {}
+
+    known_input_cols = {
+        "Listprice", "Application", "Sub Application", "SEP_SQLLangtyp",
+        "SEP_SQLMotorPowerKW", "SEP_SQLMotorEfficiency", "SEP_SQLDMR",
+        "SEP_SQLOpWaterls", "SEP_SQLOpWaterliteject", "number of ejection per hour",
+        "SEP_SQLTotalWeightKg", "SEP_SQLBowlVolumeLit", "SEP_DriveType"
+    }
+    already_cost_keys = set(costs.keys())
+
+    for col, val in row.items():
+        if col in known_input_cols or col in already_cost_keys:
+            continue
+        if not isinstance(val, (int, float)) or pd.isna(val) or val == 0:
+            continue
+
+        value = to_float(val)
+        rule = rules.get(col)
+
+        # --- Meta-Spalte ---
+        if isinstance(rule, dict) and rule.get("type") == "meta":
+            continue
+
+        # --- Formel als Dict ---
+        if isinstance(rule, dict) and "formula" in rule:
+            try:
+                calc = eval(rule["formula"], {}, {
+                    "value": value,
+                    "jahre": jahre,
+                    "betriebsstunden": betriebsstunden,
+                    "wasserpreis": wasserpreis,
+                    "strompreis": strompreis,
+                    "transportpreis": transportpreis,
+                    "infl_strom": infl_strom,
+                    "infl_wasser": infl_wasser,
+                    "forecast_cost": forecast_cost
+                })
+                costs[f"Custom: {col}"] = float(calc)
+                continue
+            except Exception:
+                pass
+
+        # --- Formel als String ---
+        if isinstance(rule, str):
+            try:
+                calc = eval(rule, {}, {
+                    "value": value,
+                    "jahre": jahre,
+                    "betriebsstunden": betriebsstunden,
+                    "wasserpreis": wasserpreis,
+                    "strompreis": strompreis,
+                    "transportpreis": transportpreis,
+                    "infl_strom": infl_strom,
+                    "infl_wasser": infl_wasser,
+                    "forecast_cost": forecast_cost
+                })
+                costs[f"Custom: {col}"] = float(calc)
+                continue
+            except Exception:
+                pass
+
+        # --- Fallback: Standardregel nur bei Kosten-ähnlichen Spalten ---
+        if is_probably_cost_column(col):
+            est = value * betriebsstunden * jahre
+            costs[f"Custom: {col}"] = float(est)
+
+    # --- Gesamtkosten ---
+    tco = sum(v for v in costs.values() if isinstance(v, (int, float)))
     costs["TCO"] = tco
     costs["Name"] = row.get("Application", "Unbekannt")
-    costs["Maschinen-Nummer"] = str(row.get("SEP_SQLLangtyp", "-"))
-
-    if kundendaten is not None:
-        kundendaten["Maschinen-Nummer"] = costs["Maschinen-Nummer"]
+    costs["Maschinen-Nummer"] = row.get("SEP_SQLLangtyp", "-")
 
     return costs
 
 def yearly_costs_detailed(row, betriebsstunden, jahre, standort, kundendaten):
     """
-    Nutzt die aggregierten Kosten (Capex, Energie, Wasser, Service, Transport usw.)
-    und verteilt sie jahresweise mit Inflationseffekten.
-    Gibt Float-Liste 'cum' zurück, die bei Capex startet und bei TCO endet.
+    Verteilt Capex (Start), Transport (einmalig), Energie/Wasser/Service (über Jahre mit Inflation),
+    Sonstiges (alles Positive außerhalb der Kern-Keys) gleichmäßig über die Jahre und Boni/Abzüge (negative Werte) ebenfalls.
+    Gibt kumulierte Jahreskosten + Totals zurück.
     """
     n = int(jahre)
     if n <= 0:
@@ -269,31 +346,40 @@ def yearly_costs_detailed(row, betriebsstunden, jahre, standort, kundendaten):
     service_total   = to_float(row.get("Service", 0.0))
     transport_total = to_float(row.get("Transport", 0.0))
 
-    # andere positive und negative Blöcke einsammeln
-    known = {"Capex", "Energie", "Wasser", "Service", "Transport", "TCO", "Name", "Maschinen-Nummer"}
-    other_pos = sum(v for k, v in row.items() if isinstance(v, (int, float)) and k not in known and v > 0)
-    negatives = sum(v for k, v in row.items() if isinstance(v, (int, float)) and v < 0)
+    # alles Positive außerhalb der Kern-Keys sammeln -> Sonstiges
+    known_keys = {"Capex", "Energie", "Wasser", "Service", "Transport", "TCO", "Name", "Maschinen-Nummer"}
+    sonstiges = sum(
+        v for k, v in row.items()
+        if isinstance(v, (int, float)) and k not in known_keys and v > 0
+    )
+    # alle negativen Werte zusammenfassen (Boni/Abzüge)
+    bonus = sum(
+        v for k, v in row.items()
+        if isinstance(v, (int, float)) and v < 0
+    )
 
-    # Energie & Wasser geometrisch nach Inflation
-    w_e = [(1 + infl_e) ** i for i in range(n)]
-    energy_by_year = [energy_total * w / sum(w_e) for w in w_e] if energy_total > 0 else [0.0]*n
+    # Energie & Wasser geometrisch nach Inflation verteilen
+    e_weights = [(1 + infl_e) ** i for i in range(n)]
+    energy_by_year = [energy_total * w / sum(e_weights) for w in e_weights] if energy_total > 0 else [0.0]*n
 
-    w_w = [(1 + infl_w) ** i for i in range(n)]
-    water_by_year = [water_total * w / sum(w_w) for w in w_w] if water_total > 0 else [0.0]*n
+    w_weights = [(1 + infl_w) ** i for i in range(n)]
+    water_by_year = [water_total * w / sum(w_weights) for w in w_weights] if water_total > 0 else [0.0]*n
 
     service_by_year   = [service_total / n] * n if service_total else [0.0]*n
-    other_by_year     = [other_pos / n] * n if other_pos else [0.0]*n
+    sonstiges_by_year = [sonstiges / n] * n if sonstiges else [0.0]*n
     transport_by_year = [transport_total] + [0.0]*(n-1) if transport_total else [0.0]*n
-    bonus_by_year     = [negatives / n] * n if negatives else [0.0]*n
+    bonus_by_year     = [bonus / n] * n if bonus else [0.0]*n
 
-    # kumuliert aufbauen
+    # kumulierte Kosten berechnen
     cum = []
     running = 0.0
     for i in range(n):
         if i == 0:
             running += capex_total
-        running += (transport_by_year[i] + energy_by_year[i] + water_by_year[i] +
-                    service_by_year[i] + other_by_year[i] + bonus_by_year[i])
+        running += (
+            transport_by_year[i] + energy_by_year[i] + water_by_year[i] +
+            service_by_year[i] + sonstiges_by_year[i] + bonus_by_year[i]
+        )
         cum.append(float(running))
 
     return {
@@ -305,8 +391,8 @@ def yearly_costs_detailed(row, betriebsstunden, jahre, standort, kundendaten):
             "water": water_total,
             "service": service_total,
             "transport": transport_total,
-            "other": other_pos,
-            "bonus": negatives,
+            "sonstiges": sonstiges,
+            "bonus": bonus,
             "tco_end": cum[-1] if cum else capex_total + transport_total
         }
     }
@@ -344,7 +430,7 @@ def yearly_costs(row, betriebsstunden, jahre, standort, kundendaten):
 # PDF Export
 # ---------------------------
 
-def export_pdf(kundendaten, top3):
+def export_pdf_bytes(kundendaten, top3, show_bonuses=False):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", "B", 16)
@@ -356,7 +442,10 @@ def export_pdf(kundendaten, top3):
     pdf.set_font("Arial", "", 12)
     pdf.cell(0, 10, "Kundendaten:", ln=True)
     for key, value in kundendaten.items():
-        pdf.cell(0, 8, f"{key}: {value}", ln=True)
+        if "Inflation" in key:
+            pdf.cell(0, 8, f"{key}: {value*100:.1f}%", ln=True)  # Prozent statt Roh-Float
+        else:
+            pdf.cell(0, 8, f"{key}: {value}", ln=True)
 
     pdf.ln(5)
     pdf.cell(0, 10, "Top 3 Maschinen (Übersicht):", ln=True)
@@ -389,28 +478,73 @@ def export_pdf(kundendaten, top3):
         pdf.set_font("Arial", "B", 14)
         pdf.cell(0, 10, f"Maschine {idx}: {row.get('Maschinen-Nummer','-')}", ln=True)
 
-        positive_costs = {k: v for k, v in row.items()
-                          if isinstance(v, (int, float)) and v > 0 and k not in ["TCO"]}
+        # Zahlen holen
+        capex_val     = to_float(row.get("Capex", 0))
+        transport_val = to_float(row.get("Transport", 0))
+        energie_val   = to_float(row.get("Energie", 0))
+        wasser_val    = to_float(row.get("Wasser", 0))
+        service_val   = to_float(row.get("Service", 0))
+
+        # Sonstiges = alle positiven Restkosten außerhalb der Kern-Keys
+        core_keys = {"Capex", "Energie", "Wasser", "Service", "Transport"}
+        sonstiges_sum = sum(
+            float(v) for k, v in row.items()
+            if isinstance(v, (int, float)) and v > 0 and k not in core_keys and k not in ["TCO"]
+        )
+
+        # Pie-Chart: Transport in Capex integrieren
+        positive_costs_for_pie = {}
+        capex_incl_transport = capex_val + transport_val
+        if capex_incl_transport > 0:
+            positive_costs_for_pie["Capex (inkl. Transport)"] = capex_incl_transport
+        if energie_val > 0:
+            positive_costs_for_pie["Energie"] = energie_val
+        if wasser_val > 0:
+            positive_costs_for_pie["Wasser"] = wasser_val
+        if service_val > 0:
+            positive_costs_for_pie["Service"] = service_val
+        if sonstiges_sum > 0:
+            positive_costs_for_pie["Sonstiges"] = sonstiges_sum
+
         negative_costs = {k: v for k, v in row.items()
                           if isinstance(v, (int, float)) and v < 0}
 
-        if positive_costs:
-            labels = list(positive_costs.keys())
-            values = list(positive_costs.values())
+        # Autopct: "Sonstiges" immer labeln, Rest nur >1%
+        def autopct_func(all_labels):
+            def inner_autopct(p):
+                label = all_labels[inner_autopct.idx]
+                inner_autopct.idx += 1
+                if label == "Sonstiges":
+                    return f"{p:.1f}%"
+                return f"{p:.1f}%" if p > 1 else ""
+            inner_autopct.idx = 0
+            return inner_autopct
+
+        # Pie
+        if positive_costs_for_pie:
+            labels = list(positive_costs_for_pie.keys())
+            values = list(positive_costs_for_pie.values())
             fig, ax = plt.subplots()
-            ax.pie(values, labels=labels, autopct="%1.1f%%")
+            ax.pie(values, labels=labels, autopct=autopct_func(labels))
             chart_path = f"chart_{idx}.png"
-            plt.savefig(chart_path)
+            plt.savefig(chart_path, bbox_inches="tight")
             plt.close()
             pdf.image(chart_path, x=30, w=150)
             os.remove(chart_path)
 
+            # Unter dem Chart: detaillierte Aufschlüsselung inkl. Capex+Transport
             pdf.ln(80)
             pdf.set_font("Arial", "", 12)
-            for lbl, val in positive_costs.items():
-                pdf.cell(0, 8, f"{lbl}: {val:,.0f} EUR", ln=True)
+            pdf.cell(0, 8, f"Capex (Anschaffung): {capex_val:,.0f} EUR", ln=True)
+            pdf.cell(0, 8, f"Transport (einmalig): {transport_val:,.0f} EUR", ln=True)
+            pdf.cell(0, 8, f"Capex gesamt (inkl. Transport): {capex_incl_transport:,.0f} EUR", ln=True)
+            if energie_val > 0:  pdf.cell(0, 8, f"Energie: {energie_val:,.0f} EUR", ln=True)
+            if wasser_val > 0:   pdf.cell(0, 8, f"Wasser: {wasser_val:,.0f} EUR", ln=True)
+            if service_val > 0:  pdf.cell(0, 8, f"Service: {service_val:,.0f} EUR", ln=True)
+            if sonstiges_sum > 0: pdf.cell(0, 8, f"Sonstiges: {sonstiges_sum:,.0f} EUR", ln=True)
 
-        if negative_costs:
+        # Abzüge/Boni optional anzeigen (werden weiterhin mitgerechnet)
+        if show_bonuses and negative_costs:
             pdf.ln(5)
             pdf.set_font("Arial", "I", 12)
             pdf.cell(0, 8, "Abzüge / Boni:", ln=True)
@@ -418,14 +552,14 @@ def export_pdf(kundendaten, top3):
                 pdf.cell(0, 8, f"- {lbl}: {val:,.0f} EUR", ln=True)
 
     # ---------------------------
-    # Break-Even Chart (3 Linien, Endkosten annotiert + im Text)
+    # Break-Even Chart & Text
     # ---------------------------
     if len(top3) >= 2:
         pdf.add_page()
         n_years = int(kundendaten["Nutzungsdauer (Jahre)"])
         fig, ax = plt.subplots()
 
-        endcosts = []  # sammeln für Text unter dem Diagramm
+        endcosts = []
 
         for _, row in top3.iterrows():
             breakdown = yearly_costs_detailed(
@@ -444,28 +578,31 @@ def export_pdf(kundendaten, top3):
             endcost = totals['tco_end']
             endcosts.append((maschinen_nr, endcost))
 
-            # Endwert im Diagramm annotieren (rechts neben der Linie)
             ax.annotate(f"{endcost:,.0f} EUR",
                         xy=(breakdown["years"][-1], cum_values[-1]),
                         xytext=(5,0), textcoords="offset points",
                         fontsize=8, color=line.get_color())
 
-            # Detaillierte Werte ins PDF schreiben
+            # Text im PDF
+            capex_only   = totals['capex']
+            transport    = totals['transport']
+            capex_plus_t = capex_only + transport
+
             pdf.ln(5)
             pdf.set_font("Arial", "", 11)
             pdf.cell(0, 8, f"Maschine {maschinen_nr}", ln=True)
-            pdf.cell(0, 8, f"  Startkosten (Capex): {totals['capex']:,.0f} EUR", ln=True)
-            pdf.cell(0, 8, f"  Transport (einmalig): {totals['transport']:,.0f} EUR", ln=True)
+            pdf.cell(0, 8, f"  Startkosten (Capex): {capex_only:,.0f} EUR", ln=True)
+            pdf.cell(0, 8, f"  Transport (einmalig): {transport:,.0f} EUR", ln=True)
+            pdf.cell(0, 8, f"  Capex gesamt (inkl. Transport): {capex_plus_t:,.0f} EUR", ln=True)
             pdf.cell(0, 8, f"  Energie über {n_years} Jahre: {totals['energy']:,.0f} EUR", ln=True)
             pdf.cell(0, 8, f"  Wasser über {n_years} Jahre: {totals['water']:,.0f} EUR", ln=True)
             pdf.cell(0, 8, f"  Service über {n_years} Jahre: {totals['service']:,.0f} EUR", ln=True)
-            if abs(totals.get("other", 0.0)) > 1e-6:
-                pdf.cell(0, 8, f"  Weitere Kosten: {totals['other']:,.0f} EUR", ln=True)
-            if abs(totals.get("bonus", 0.0)) > 1e-6:
+            if abs(totals.get("sonstiges", 0.0)) > 1e-6:
+                pdf.cell(0, 8, f"  Sonstiges: {totals['sonstiges']:,.0f} EUR", ln=True)
+            if show_bonuses and abs(totals.get("bonus", 0.0)) > 1e-6:
                 pdf.cell(0, 8, f"  Abzüge/Boni: {totals['bonus']:,.0f} EUR", ln=True)
             pdf.cell(0, 8, f"  Gesamtkosten nach {n_years} Jahren: {endcost:,.0f} EUR", ln=True)
 
-        # Achseneinstellungen
         ax.set_xlabel("Jahre")
         ax.set_ylabel("Kumulierte Kosten (EUR)")
         ax.ticklabel_format(style="plain", axis="y")
@@ -478,16 +615,21 @@ def export_pdf(kundendaten, top3):
         pdf.image(img_path, x=30, w=150)
         os.remove(img_path)
 
-        # Endkosten zusätzlich gesammelt unten schreiben
         pdf.ln(5)
         pdf.set_font("Arial", "B", 12)
         pdf.cell(0, 10, "Endkosten aus dem Diagramm:", ln=True)
         for maschinen_nr, endcost in endcosts:
             pdf.cell(0, 8, f"- Maschine {maschinen_nr}: {endcost:,.0f} EUR", ln=True)
 
-    output_path = "GEA_TCO_Report.pdf"
-    pdf.output(output_path)
-    return output_path
+    # ---------------------------
+    # Bytes statt Datei zurückgeben
+    # ---------------------------
+    out = pdf.output(dest='S')
+    if isinstance(out, str):
+        pdf_bytes = out.encode('latin-1')
+    else:
+        pdf_bytes = bytes(out)   # sicherstellen, dass es wirklich bytes sind
+    return pdf_bytes, "GEA_TCO_Report.pdf"
 
 # ---------------------------
 # Streamlit App
@@ -524,11 +666,11 @@ def main():
     standort = st.selectbox("Standort", ["Düsseldorf", "Berlin", "Mailand", "Kopenhagen", "Lyon"])
     feststoffanteil = st.number_input("Feststoffanteil (%)", 0.0, 100.0, 5.0, 0.5)
     betriebsstunden = st.number_input("Betriebsstunden pro Jahr", 100, 8760, 4000, 100)
-    nutzungsdauer = st.number_input("Nutzungsdauer (Jahre)", 1, 100000, 10)  # ⚡ ohne Limit
-    budget = st.number_input("Budget (EUR)", 0, value=500000)
+    nutzungsdauer = st.number_input("Nutzungsdauer (Jahre)", 1, 100000, 10)
+    budget = st.number_input("Budget (EUR, optional)", 0, value=0)  # optional
 
     # ---------------------------
-    # Forecast-Parameter (% pro Jahr statt Slider)
+    # Forecast-Parameter
     # ---------------------------
     st.subheader("Forecast-Parameter")
     strom_inflation = st.number_input("Strompreissteigerung (% pro Jahr)", min_value=0.0, max_value=20.0, value=3.0, step=0.1)
@@ -559,19 +701,47 @@ def main():
             results.append(res)
 
         res_df = pd.DataFrame(results).sort_values("TCO").reset_index(drop=True)
+
+        # Budgetfilter optional
+        if budget and budget > 0:
+            res_df = res_df[res_df["TCO"] <= budget]
+
         st.session_state["results_df"] = res_df
 
     if "results_df" in st.session_state:
         res_df = st.session_state["results_df"]
-        top3 = res_df.head(3)
+        if res_df.empty:
+            st.warning("Keine Maschine erfüllt die Kriterien (Budgetfilter aktiv?).")
+        else:
+            top3 = res_df.head(3)
 
-        st.subheader("Top 3 Maschinen")
-        st.dataframe(top3)
+            st.subheader("Top 3 Maschinen")
+            st.dataframe(top3)
 
-        if st.button("PDF erstellen"):
-            pdf_path = export_pdf(kundendaten, top3)
-            with open(pdf_path, "rb") as f:
-                st.download_button("Download PDF", f, file_name=pdf_path)
+            # Checkbox immer sichtbar
+            show_bonuses = st.checkbox(
+                "Boni im PDF anzeigen?",
+                value=st.session_state.get("show_bonuses", False),
+                key="show_bonuses"
+            )
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                if st.button("PDF erstellen", key="btn_build_pdf"):
+                    pdf_bytes, fname = export_pdf_bytes(kundendaten, top3, show_bonuses=show_bonuses)
+                    st.session_state["pdf_bytes"] = pdf_bytes
+                    st.session_state["pdf_filename"] = fname
+
+            with col2:
+                if "pdf_bytes" in st.session_state:
+                    st.download_button(
+                        "Download PDF",
+                        data=st.session_state["pdf_bytes"],
+                        file_name=st.session_state.get("pdf_filename", "GEA_TCO_Report.pdf"),
+                        mime="application/pdf",
+                        key="btn_download_pdf"
+                    )
 
 if __name__ == "__main__":
     main()
